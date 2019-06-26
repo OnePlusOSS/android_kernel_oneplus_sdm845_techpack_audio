@@ -748,6 +748,30 @@ void tfa98xx_key2(struct tfa_device *tfa, int lock)
 	/* unhide lock registers */
 	reg_write(tfa, (tfa->tfa_family == 1) ? 0x40 :0x0F, 0);
 }
+void tfa2_manual_mtp_cpy(struct tfa_device *tfa,  uint16_t reg_row_to_keep,uint16_t reg_row_to_set ,uint8_t row)///MCH_TO_TEST
+{
+	uint16_t value;
+	enum Tfa98xx_Error error;
+	/* Assure FAIM is enabled (enable it when neccesery) */
+	error = tfa98xx_faim_protect(tfa, 1);
+	if (tfa->verbose) {
+		pr_debug("FAIM enabled (err:%d).\n", error);
+	}
+	reg_read(tfa, (unsigned char)reg_row_to_keep, &value);
+	if (!row) {
+		reg_write(tfa, 0xA7, value);
+		reg_write(tfa, 0xA8, reg_row_to_set);
+	} else {
+		reg_write(tfa, 0xA7, reg_row_to_set);
+		reg_write(tfa, 0xA8, value);
+	}
+	reg_write(tfa, 0xA3, 0x10|row);
+
+	error = tfa98xx_faim_protect(tfa, 0);
+	if (tfa->verbose) {
+		pr_debug("FAIM disabled (err:%d).\n", error);
+	}
+}
 
 enum Tfa98xx_Error tfa98xx_set_mtp(struct tfa_device *tfa, uint16_t value, uint16_t mask)
 {
@@ -789,7 +813,11 @@ enum Tfa98xx_Error tfa98xx_set_mtp(struct tfa_device *tfa, uint16_t value, uint1
 	tfa98xx_key2(tfa, 0); /* unlock */
 	TFA_WRITE_REG(tfa, MTP0, mtp_new); 	/* write to i2c shadow reg */
 	/* CIMTP=1 start copying all the data from i2c regs_mtp to mtp*/
-	TFA_SET_BF(tfa, CIMTP, 1);
+	if (tfa->tfa_family == 2)
+		tfa2_manual_mtp_cpy(tfa, 0xF1, mtp_new, 0);
+	else
+		TFA_SET_BF(tfa, CIMTP, 1);
+
 	/* no check for MTPBUSY here, i2c delay assumed to be enough */
 	tfa98xx_key2(tfa, 1); /* lock */
 
@@ -1081,7 +1109,8 @@ enum Tfa98xx_Error
 tfa_dsp_patch(struct tfa_device *tfa, int patchLength,
 		 const unsigned char *patchBytes)
 {
-	enum Tfa98xx_Error error;
+	 enum Tfa98xx_Error error = Tfa98xx_Error_Ok;
+	 int status;
 	if(tfa->in_use == 0)
 		return Tfa98xx_Error_NotOpen;
 
@@ -1092,6 +1121,18 @@ tfa_dsp_patch(struct tfa_device *tfa, int patchLength,
 	if (Tfa98xx_Error_Ok != error) {
 		return error;
 	}
+	tfa98xx_dsp_system_stable(tfa, &status);
+	if (!status)
+		return Tfa98xx_Error_NoClock;
+	if (error == Tfa98xx_Error_Ok) {
+		pr_info("tfa cold boot patch\n");
+		error = tfaRunColdboot(tfa, 1);
+		if (error) {
+			pr_err("tfa_dsp_patch DSP_not_running\n");
+			return Tfa98xx_Error_DSP_not_running;
+		 }
+	}
+
 	error =
 	    tfa98xx_process_patch_file(tfa, patchLength - PATCH_HEADER_LENGTH,
 			     patchBytes + PATCH_HEADER_LENGTH);
@@ -3032,7 +3073,7 @@ error_exit:
 enum tfa_error tfa_dev_stop(struct tfa_device *tfa)
 {
 	enum Tfa98xx_Error err = Tfa98xx_Error_Ok;
-
+        int times = 0, ready;
 	/* mute */
 	tfaRunMute(tfa);
 
@@ -3047,7 +3088,23 @@ enum tfa_error tfa_dev_stop(struct tfa_device *tfa)
 	/* disable I2S output on TFA1 devices without TDM */
 	err = tfa98xx_aec_output(tfa, 0);
 
-	return err;
+	while ((TFA_GET_BF(tfa, MANSTATE) != 0) && (times++ < 20)) {
+		pr_info("tfa stop wait state machine goto powerdown mode.\n");
+		err = tfa98xx_dsp_system_stable(tfa, &ready);
+		if (err != Tfa98xx_Error_Ok || !ready) {
+			pr_err("tfa stop: No I2S CLK\n");
+			break;
+		}
+		msleep_interruptible(5);
+	}
+
+	if (times < 20) {
+		pr_debug("tfa stop: already in PowerDown\n");
+	} else {
+		pr_debug("tfa stop: Not in PowerDown\n");
+	}
+
+	return (enum tfa_error)err;	//liuhaituo modify
 }
 
 /*
